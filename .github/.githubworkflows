@@ -1,0 +1,21 @@
+name: Compilar PSP EBOOT
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+
+    steps:
+      - name: Copiar repositorio
+        uses: actions/checkout@v4
+
+      - name: Compilar con Make
+        run: make
+
+      - name: Guardar el EBOOT.PBP
+        uses: actions/upload-artifact@v4
+        with:
+          name: EBOOT
+          path: EBOOT.PBP
