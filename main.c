@@ -7,9 +7,9 @@
 #include <malloc.h>
 
 PSP_MODULE_INFO("NarutoBattle_PSP", 0, 1, 1);
-PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
-static unsigned int __attribute__((aligned(16))) list[256];
+static unsigned int __attribute__((aligned(16))) list[262144];
 
 int exit_callback(int arg1, int arg2, void *common) {
     sceKernelExitGame();
@@ -53,17 +53,20 @@ void drawRect(int x, int y, int w, int h, unsigned int color) {
 int main(void) {
     SetupCallbacks();
 
+    // Inicialización segura del entorno gráfico GU
     sceGuInit();
     sceGuStart(GU_DIRECT, list);
     sceGuDrawBuffer(GU_PSM_8888, (void*)0, 512);
     sceGuDispBuffer(480, 272, (void*)0x88000, 512);
     sceGuDepthBuffer((void*)0x110000, 512);
-    sceGuOffset(260 / 2, 272 / 2);
-    sceGuViewport(480 / 2, 272 / 2, 480 / 2, 272 / 2);
+    sceGuOffset(2048 - (480 / 2), 2048 - (272 / 2));
+    sceGuViewport(2048, 2048, 480, 272);
     sceGuDepthRange(0xcf7f, 0x0f7f);
     sceGuEnable(GU_SCISSOR_TEST);
+    sceGuScissor(0, 0, 480, 272);
     sceGuFinish();
     sceGuSync(0, 0);
+    
     sceGuDisplay(1);
 
     int p1_x = 60;
@@ -93,19 +96,23 @@ int main(void) {
             }
         }
 
+        // Renderizado de pantalla estable
         sceGuStart(GU_DIRECT, list);
         sceGuClearColor(0xFF101018);
         sceGuClearDepth(0);
         sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
 
+        // Suelo
         drawRect(0, 210, 480, 62, 0xFF225588);
 
+        // Barras de vida (HUD estilo Storm)
         drawRect(20, 15, 160, 16, 0xFF000000);
         drawRect(22, 17, p1_vida, 12, 0xFF00FF00);
 
         drawRect(300, 15, 160, 16, 0xFF000000);
         drawRect(302, 17, 140, 12, 0xFF0000FF);
 
+        // Personajes (P1 azul, P2 rojo)
         drawRect(p1_x, 155, 32, 55, 0xFF0077FF); 
         drawRect(p2_x, 155, 32, 55, 0xFF2222CC); 
 
