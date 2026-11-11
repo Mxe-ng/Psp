@@ -1,121 +1,121 @@
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
-#include <stdlib.h>
+#include <pspgu.h>
+#include <pspgum.h>
+#include <stdio.h>
+#include <malloc.h>
 
-PSP_MODULE_INFO("Juego2DPSP", 0, 1, 0);
+PSP_MODULE_INFO("NarutoBattle_PSP", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
-/* Callback para salir del juego correctamente desde el menú */
+static unsigned int __attribute__((aligned(16))) list[256];
+
 int exit_callback(int arg1, int arg2, void *common) {
     sceKernelExitGame();
     return 0;
 }
 
 int CallbackThread(SceSize args, void *argp) {
-    int cbid = sceKernelCreateCallback("Exit Callback", exit_callback, NULL);
+    int cbid = sceKernelCreateCallback("Exit Callback", (void*)exit_callback, NULL);
     sceKernelRegisterExitCallback(cbid);
     sceKernelSleepThreadCB();
     return 0;
 }
 
-void setupCallbacks(void) {
+int SetupCallbacks(void) {
     int thid = sceKernelCreateThread("update_thread", CallbackThread, 0x11, 0xFA0, 0, 0);
-    if (thid >= 0) {
-        sceKernelStartThread(thid, 0, 0);
-    }
+    if (thid >= 0)
+        sceKernelStartThread(thid, 0, NULL);
+    return thid;
+}
+
+typedef struct {
+    unsigned int color;
+    short x, y, z;
+} Vertex;
+
+void drawRect(int x, int y, int w, int h, unsigned int color) {
+    Vertex* vertices = (Vertex*) sceGuGetMemory(2 * sizeof(Vertex));
+    vertices[0].color = color;
+    vertices[0].x = x;
+    vertices[0].y = y;
+    vertices[0].z = 0;
+
+    vertices[1].color = color;
+    vertices[1].x = x + w;
+    vertices[1].y = y + h;
+    vertices[1].z = 0;
+
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, vertices);
 }
 
 int main(void) {
-    pspDebugScreenInit();
-    setupCallbacks();
+    SetupCallbacks();
 
-    // Configurar lectura de controles digitales (cruceta y botones)
-    sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+    sceGuInit();
+    sceGuStart(GU_DIRECT, list);
+    sceGuDrawBuffer(GU_PSM_8888, (void*)0, 512);
+    sceGuDispBuffer(480, 272, (void*)0x88000, 512);
+    sceGuDepthBuffer((void*)0x110000, 512);
+    sceGuOffset(260 / 2, 272 / 2);
+    sceGuViewport(480 / 2, 272 / 2, 480 / 2, 272 / 2);
+    sceGuDepthRange(0xcf7f, 0x0f7f);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceGuDisplay(1);
+
+    int p1_x = 60;
+    int p2_x = 350;
+    int p1_vida = 150;
+    int velocidad = 3;
+
     SceCtrlData pad;
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    // Variables del jugador y obstáculo
-    int player_x = 240; // Centro de la pantalla de la PSP (480x272)
-    int player_y = 230;
-    
-    int obstacle_x = rand() % 440;
-    int obstacle_y = 0;
-    int obstacle_speed = 3;
-
-    int score = 0;
-    int game_over = 0;
-
-    while (1) {
+    while(1) {
         sceCtrlReadBufferPositive(&pad, 1);
 
-        if (!game_over) {
-            // Movimiento del jugador con la cruceta izquierda / derecha
-            if (pad.Buttons & PSP_CTRL_LEFT)  player_x -= 6;
-            if (pad.Buttons & PSP_CTRL_RIGHT) player_x += 6;
+        if (pad.Buttons & PSP_CTRL_RIGHT) {
+            p1_x += velocidad;
+            if (p1_x > 380) p1_x = 380;
+        }
+        if (pad.Buttons & PSP_CTRL_LEFT) {
+            p1_x -= velocidad;
+            if (p1_x < 10) p1_x = 10;
+        }
 
-            // Limitar al jugador dentro de los bordes de la pantalla
-            if (player_x < 10)  player_x = 10;
-            if (player_x > 450) player_x = 450;
-
-            // Mover el obstáculo hacia abajo
-            obstacle_y += obstacle_speed;
-
-            // Si el obstáculo llega al fondo, reaparece arriba y suma puntos
-            if (obstacle_y > 250) {
-                obstacle_y = 0;
-                obstacle_x = rand() % 440;
-                score += 10;
-                // Aumentar dificultad gradualmente
-                if (score % 50 == 0) obstacle_speed++;
-            }
-
-            // Detección de colisión simple (Caja de impacto)
-            if (obstacle_y >= 210 && obstacle_y <= 235) {
-                if (player_x >= obstacle_x - 15 && player_x <= obstacle_x + 25) {
-                    game_over = 1; // ¡Colisión!
-                }
-            }
-        } else {
-            // Reiniciar juego con el botón START
-            if (pad.Buttons & PSP_CTRL_START) {
-                player_x = 240;
-                obstacle_y = 0;
-                score = 0;
-                obstacle_speed = 3;
-                game_over = 0;
+        if (pad.Buttons & PSP_CTRL_CIRCLE) {
+            if (p1_x + 40 >= p2_x) {
+                if (p1_vida > 0) p1_vida -= 1;
             }
         }
 
-        // --- RENDERIZADO EN PANTALLA ---
-        pspDebugScreenClear();
+        sceGuStart(GU_DIRECT, list);
+        sceGuClearColor(0xFF101018);
+        sceGuClearDepth(0);
+        sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
 
-        // Interfaz superior
-        pspDebugScreenSetXY(2, 1);
-        pspDebugScreenPrintf("=== MINI JUEGO PSP ===");
-        pspDebugScreenSetXY(35, 1);
-        pspDebugScreenPrintf("PUNTOS: %d", score);
+        drawRect(0, 210, 480, 62, 0xFF225588);
 
-        if (!game_over) {
-            // Dibujar obstáculo (enemigo)
-            pspDebugScreenSetXY(obstacle_x / 8, obstacle_y / 8);
-            pspDebugScreenPrintf("[ X ]");
+        drawRect(20, 15, 160, 16, 0xFF000000);
+        drawRect(22, 17, p1_vida, 12, 0xFF00FF00);
 
-            // Dibujar jugador
-            pspDebugScreenSetXY(player_x / 8, player_y / 8);
-            pspDebugScreenPrintf("  A  ");
-        } else {
-            // Pantalla de Game Over
-            pspDebugScreenSetXY(18, 12);
-            pspDebugScreenPrintf("¡GAME OVER!");
-            pspDebugScreenSetXY(14, 14);
-            pspDebugScreenPrintf("Pulsa START para reiniciar");
-        }
+        drawRect(300, 15, 160, 16, 0xFF000000);
+        drawRect(302, 17, 140, 12, 0xFF0000FF);
 
-        // Sincronizar a 60 FPS estables usando el refresco vertical de la PSP
+        drawRect(p1_x, 155, 32, 55, 0xFF0077FF); 
+        drawRect(p2_x, 155, 32, 55, 0xFF2222CC); 
+
+        sceGuFinish();
+        sceGuSync(0, 0);
+
         sceDisplayWaitVblankStart();
+        sceGuSwapBuffers();
     }
 
+    sceGuTerm();
     return 0;
 }
