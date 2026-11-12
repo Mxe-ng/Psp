@@ -1,674 +1,640 @@
-// "Corazon Esquiva" - juego original para PSP (homebrew, PSPSDK)
-// Esquiva proyectiles dentro de una caja y luego elige HABLAR o PERDONAR.
-// Musica y efectos: sintetizados en codigo (originales). Graficos: renderer por software.
+// "NINJA TORMENTA" - juego de peleas ninja ORIGINAL para PSP (homebrew, PSPSDK)
+// Personajes, musica y efectos originales. Optimizado: CPU a 333 MHz, fondo pre-renderizado,
+// pools fijos sin malloc, sin alpha por pixel en las rutas calientes.
+//
+// Controles:  Cruz/Stick = mover (arriba o X = saltar)   CUADRADO = golpe (combo x3)
+//             TRIANGULO = kunai (8 chakra)   CIRCULO = esquive / SUSTITUCION al ser golpeado (25 chakra)
+//             L = cargar chakra   R = guardia   CUADRADO+TRIANGULO con chakra 100 = TECNICA FINAL
 #include <pspkernel.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
 #include <psprtc.h>
 #include <pspaudio.h>
+#include <psppower.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
 
-PSP_MODULE_INFO("CorazonEsquiva", 0, 1, 1);
+PSP_MODULE_INFO("NinjaTormenta", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
 #define SW 480
 #define SH 272
 #define STRIDE 512
-#define MAXB 128
-#define MAXP 160
-#define NSTAR 48
 #define PI_F 3.14159265f
-
 #define RGB(r,g,b) (0xFF000000u | ((unsigned)(b) << 16) | ((unsigned)(g) << 8) | (unsigned)(r))
 
-static volatile int g_song = 1;      // 0 batalla, 1 calma, 2 silencio
-static volatile int g_sfx_req = 0;
-static volatile int g_quit = 0;
-
-enum { SFX_NONE, SFX_HIT, SFX_SELECT, SFX_CONFIRM, SFX_SPARE, SFX_LOSE, SFX_TALK };
+#include "audio.inc"   // sintetizador: SFX_HIT/SELECT/CONFIRM/SPARE/LOSE/TALK/BLIP + 3 musicas
+#include "gfx.inc"     // canvas, rect, circle, fuente 5x7, text, textc...
 
 /* ===================================================================== */
-/*  CALLBACKS                                                            */
+/*  CONSTANTES Y TIPOS                                                   */
 /* ===================================================================== */
-static int exit_cb(int a, int b, void *c) { g_quit = 1; sceKernelExitGame(); return 0; }
-static int cb_thread(SceSize args, void *argp) {
-    int id = sceKernelCreateCallback("exit", exit_cb, NULL);
-    sceKernelRegisterExitCallback(id);
-    sceKernelSleepThreadCB();
-    return 0;
-}
-static void setup_callbacks(void) {
-    int t = sceKernelCreateThread("cb", cb_thread, 0x11, 0xFA0, 0, NULL);
-    if (t >= 0) sceKernelStartThread(t, 0, NULL);
-}
+#define GY 214               // suelo
+#define MAXPJ 12
+#define MAXPT 96
+#define ROUND_FRAMES (60 * 60)
 
-/* ===================================================================== */
-/*  AUDIO: sintetizador chiptune (musica original + efectos)             */
-/* ===================================================================== */
-#define SR 44100
-#define NSAMP 512
+enum { PJ_KUNAI = 1, PJ_ORB = 2 };
+enum { ST_TITLE, ST_INTRO, ST_FIGHT, ST_RDEND, ST_MATCH };
 
-static const unsigned char battle_lead[32] = {
-    69,0,72,0,76,0,74,72,   71,0,74,0,79,0,76,74,
-    72,0,76,0,81,0,79,76,   74,0,77,76,74,72,71,0 };
-static const unsigned char battle_bass[32] = {
-    45,0,45,0,52,0,45,0,    43,0,43,0,50,0,43,0,
-    41,0,41,0,48,0,41,0,    50,0,50,0,57,0,50,0 };
-static const unsigned char battle_arp[32] = {
-    57,60,64,60,57,60,64,60, 55,59,62,59,55,59,62,59,
-    53,57,60,57,53,57,60,57, 50,53,57,53,50,53,57,53 };
+typedef struct { float x, y, vx; int kind, on, owner, t; } Pj;
+typedef struct { float x, y, vx, vy; int life, max, kind; u32 col; } Pt;
 
-static const unsigned char calm_lead[32] = {
-    76,0,79,0,81,79,76,0,   74,0,76,0,79,0,74,0,
-    72,0,76,0,79,81,79,76,  74,0,0,0,72,0,0,0 };
-static const unsigned char calm_bass[32] = {
-    48,0,0,0,55,0,0,0,      43,0,0,0,50,0,0,0,
-    45,0,0,0,52,0,0,0,      41,0,0,0,48,0,0,0 };
-static const unsigned char calm_arp[32] = {
-    60,64,67,64,60,64,67,64, 59,62,67,62,59,62,67,62,
-    57,60,64,60,57,60,64,60, 57,60,65,60,57,60,65,60 };
+typedef struct {
+    int l, r, jump, atk, kun, dash, guard, charge, ult;   // l,r,guard,charge = mantenido; resto = pulsacion
+} In;
 
-static float mtof(int n) { return 440.0f * powf(2.0f, (n - 69) / 12.0f); }
+typedef struct {
+    float x, y, vx, vy, ch;
+    int hp, dir, atk, atkn, chain, hurt, dash, dcd, ground, guard, charging;
+    int subw, lastd, ult, hitdone, kcd, wins, ko, ai_t, ai_a, glow;
+    float logx; int logt;                    // tronco de sustitucion
+    u32 col, col2; const char *name;
+} F;
 
-static int audio_thread(SceSize args, void *argp) {
-    int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, NSAMP, PSP_AUDIO_FORMAT_STEREO);
-    if (ch < 0) return 0;
-    static short buf[NSAMP * 2];
+static Pj pj[MAXPJ];
+static Pt pt[MAXPT];
+static u32 bg[STRIDE * SH] __attribute__((aligned(64)));
+static float stars_x[40], stars_y[40];
+static float sintab[256];
+static int shake = 0, flashv = 0, hitstop = 0;
 
-    int song = -1, step = 0, samp = 0, spstep = 10000;
-    float phl = 0, phb = 0, pha = 0, kph = 0;
-    float fl = 0, fbs = 0, fa = 0;
-    unsigned int rng = 2463534242u;
-    int dtype = 0, dsamp = 0;
-    int sfx = 0, sfxt = 0;
-    float sfxph = 0;
-
-    while (!g_quit) {
-        for (int i = 0; i < NSAMP; i++) {
-            int s = g_song;
-            if (s != song) {
-                song = s;
-                spstep = (song == 0) ? (SR * 60 / (150 * 2)) : (SR * 60 / (96 * 2));
-                step = 31;
-                samp = spstep;
-            }
-            if (samp >= spstep) {
-                samp = 0;
-                step = (step + 1) & 31;
-                if (song == 2) {
-                    fl = fbs = fa = 0; dtype = 0;
-                } else {
-                    const unsigned char *L = (song == 0) ? battle_lead : calm_lead;
-                    const unsigned char *B = (song == 0) ? battle_bass : calm_bass;
-                    const unsigned char *A = (song == 0) ? battle_arp : calm_arp;
-                    fl  = L[step] ? mtof(L[step]) : 0;
-                    fbs = B[step] ? mtof(B[step]) : 0;
-                    fa  = A[step] ? mtof(A[step]) : 0;
-                    dtype = 0;
-                    if (song == 0) {
-                        if ((step & 7) == 0) dtype = 1;
-                        else if ((step & 7) == 4) dtype = 2;
-                        else if (step & 1) dtype = 3;
-                    } else {
-                        if ((step & 15) == 0) dtype = 1;
-                        else if ((step & 3) == 2) dtype = 3;
-                    }
-                    dsamp = 0;
-                }
-            }
-            float t = (float)samp / (float)spstep;
-            float m = 0;
-
-            if (fl > 0) {
-                phl += fl / SR; if (phl >= 1.0f) phl -= 1.0f;
-                m += (phl < 0.25f ? 1.0f : -1.0f) * 0.16f * (1.0f - 0.55f * t);
-            }
-            if (fbs > 0) {
-                phb += fbs / SR; if (phb >= 1.0f) phb -= 1.0f;
-                m += (4.0f * fabsf(phb - 0.5f) - 1.0f) * 0.30f * (1.0f - 0.3f * t);
-            }
-            if (fa > 0) {
-                pha += fa / SR; if (pha >= 1.0f) pha -= 1.0f;
-                m += (pha < 0.5f ? 1.0f : -1.0f) * 0.07f * (1.0f - t);
-            }
-            rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-            float nz = (rng & 1) ? 1.0f : -1.0f;
-            if (dtype) {
-                int dur = (dtype == 1) ? 5500 : ((dtype == 2) ? 7000 : 1800);
-                if (dsamp < dur) {
-                    float dt = (float)dsamp / (float)dur;
-                    if (dtype == 1) {
-                        kph += (130.0f - 95.0f * dt) / SR; if (kph >= 1.0f) kph -= 1.0f;
-                        m += (4.0f * fabsf(kph - 0.5f) - 1.0f) * 0.45f * (1.0f - dt);
-                    } else if (dtype == 2) {
-                        m += nz * 0.16f * (1.0f - dt);
-                    } else {
-                        m += nz * 0.05f * (1.0f - dt);
-                    }
-                    dsamp++;
-                }
-            }
-
-            if (g_sfx_req) { sfx = g_sfx_req; g_sfx_req = 0; sfxt = 0; sfxph = 0; }
-            if (sfx) {
-                float f = 0, v = 0, x = 0;
-                int dur = 1;
-                switch (sfx) {
-                case SFX_HIT:
-                    dur = 9000; x = (float)sfxt / dur; f = 220.0f - 160.0f * x;
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = ((sfxph < 0.5f ? 1.0f : -1.0f) * 0.5f + nz * 0.5f) * (1.0f - x) * 0.45f;
-                    break;
-                case SFX_SELECT:
-                    dur = 2200; x = (float)sfxt / dur; f = 880.0f;
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = (sfxph < 0.5f ? 1.0f : -1.0f) * 0.22f * (1.0f - x);
-                    break;
-                case SFX_CONFIRM:
-                    dur = 6000; x = (float)sfxt / dur; f = (sfxt < 2500) ? 660.0f : 990.0f;
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = (sfxph < 0.5f ? 1.0f : -1.0f) * 0.22f * (1.0f - x);
-                    break;
-                case SFX_SPARE: {
-                    static const float arp[4] = { 523.0f, 659.0f, 784.0f, 1047.0f };
-                    dur = 14000;
-                    int idx = sfxt / 3500; if (idx > 3) idx = 3;
-                    float local = (float)(sfxt % 3500) / 3500.0f;
-                    f = arp[idx];
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = (sfxph < 0.5f ? 1.0f : -1.0f) * 0.22f * (1.0f - 0.6f * local);
-                    break;
-                }
-                case SFX_LOSE:
-                    dur = 32000; x = (float)sfxt / dur;
-                    f = 440.0f - 330.0f * x + 8.0f * sinf(sfxt * 0.002f);
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = (sfxph < 0.5f ? 1.0f : -1.0f) * 0.25f * (1.0f - x);
-                    break;
-                case SFX_TALK: {
-                    dur = 8000;
-                    int slot = sfxt / 1300;
-                    int loc = sfxt % 1300;
-                    f = 300.0f + (float)((slot * 53) % 5) * 35.0f;
-                    sfxph += f / SR; if (sfxph >= 1.0f) sfxph -= 1.0f;
-                    v = (loc < 1000) ? (sfxph < 0.5f ? 1.0f : -1.0f) * 0.18f * (1.0f - (float)loc / 1000.0f) : 0.0f;
-                    break;
-                }
-                default: dur = 1; break;
-                }
-                m += v;
-                sfxt++;
-                if (sfxt >= dur) sfx = 0;
-            }
-
-            samp++;
-            m *= 0.8f;
-            if (m > 1.0f) m = 1.0f;
-            if (m < -1.0f) m = -1.0f;
-            short o = (short)(m * 30000.0f);
-            buf[i * 2] = o;
-            buf[i * 2 + 1] = o;
-        }
-        sceAudioOutputBlocking(ch, PSP_AUDIO_VOLUME_MAX, buf);
-    }
-    sceAudioChRelease(ch);
-    return 0;
-}
-
-static void sfx_play(int id) { g_sfx_req = id; }
+static inline float fsin(float a) { return sintab[((int)(a * 40.7437f)) & 255]; }   // 256/(2*PI)
 
 /* ===================================================================== */
-/*  GRAFICOS: canvas en RAM + alpha blending, copiado a VRAM             */
+/*  PARTICULAS                                                           */
 /* ===================================================================== */
-static u32 canvas[STRIDE * SH] __attribute__((aligned(64)));
-static u32 *vram[2];
-static int ox = 0, oy = 0;
-
-static inline u32 mixc(u32 d, u32 s, int a) {
-    int dr = d & 255, dg = (d >> 8) & 255, db = (d >> 16) & 255;
-    int sr = s & 255, sg = (s >> 8) & 255, sb = (s >> 16) & 255;
-    int r = (dr * (255 - a) + sr * a) / 255;
-    int g = (dg * (255 - a) + sg * a) / 255;
-    int b = (db * (255 - a) + sb * a) / 255;
-    return RGB(r, g, b);
-}
-static inline void put(int x, int y, u32 c) {
-    x += ox; y += oy;
-    if ((unsigned)x < SW && (unsigned)y < SH) canvas[y * STRIDE + x] = c;
-}
-static inline void putA(int x, int y, u32 c, int a) {
-    x += ox; y += oy;
-    if ((unsigned)x >= SW || (unsigned)y >= SH) return;
-    u32 *p = &canvas[y * STRIDE + x];
-    *p = mixc(*p, c, a);
-}
-static void rect(int x, int y, int w, int h, u32 c) {
-    for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) put(x + i, y + j, c);
-}
-static void rectA(int x, int y, int w, int h, u32 c, int a) {
-    for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) putA(x + i, y + j, c, a);
-}
-static void frame(int x, int y, int w, int h, int t, u32 c) {
-    rect(x, y, w, t, c); rect(x, y + h - t, w, t, c);
-    rect(x, y, t, h, c); rect(x + w - t, y, t, h, c);
-}
-static void circle(int cx, int cy, int r, u32 c) {
-    for (int dy = -r; dy <= r; dy++) {
-        int dx = (int)sqrtf((float)(r * r - dy * dy));
-        for (int x = -dx; x <= dx; x++) put(cx + x, cy + dy, c);
-    }
-}
-static void circleA(int cx, int cy, int r, u32 c, int a) {
-    for (int dy = -r; dy <= r; dy++) {
-        int dx = (int)sqrtf((float)(r * r - dy * dy));
-        for (int x = -dx; x <= dx; x++) putA(cx + x, cy + dy, c, a);
-    }
-}
-
-/* ---- fuente 5x7 (mayusculas, digitos y algo de puntuacion) ---- */
-static const char font_order[] = " !',-./0123456789:>?ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-static const unsigned char font5x7[][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x05,0x03,0x00,0x00},
-    {0x00,0x40,0x30,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x60,0x60,0x00,0x00},
-    {0x20,0x10,0x08,0x04,0x02},
-    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
-    {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
-    {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
-    {0x06,0x49,0x49,0x29,0x1E},
-    {0x00,0x36,0x36,0x00,0x00}, {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x51,0x09,0x06},
-    {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
-    {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
-    {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00},
-    {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
-    {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
-    {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
-    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F},
-    {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63},
-    {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}
-};
-
-static void draw_char(int x, int y, int s, u32 c, char ch) {
-    const char *p = strchr(font_order, toupper((unsigned char)ch));
-    int idx = (p && ch) ? (int)(p - font_order) : 0;
-    for (int col = 0; col < 5; col++) {
-        unsigned char bits = font5x7[idx][col];
-        for (int row = 0; row < 7; row++)
-            if (bits & (1 << row)) rect(x + col * s, y + row * s, s, s, c);
-    }
-}
-static int text_w(int s, const char *str) { return (int)strlen(str) * 6 * s; }
-static void text(int x, int y, int s, u32 c, const char *str) {
-    for (int pass = 0; pass < 2; pass++) {
-        int cx = x + (pass == 0 ? s : 0), cy = y + (pass == 0 ? s : 0);
-        u32 col = (pass == 0) ? RGB(20, 10, 40) : c;
-        for (const char *p = str; *p; p++) { draw_char(cx, cy, s, col, *p); cx += 6 * s; }
-    }
-}
-static void textc(int cx, int y, int s, u32 c, const char *str) {
-    while (s > 1 && text_w(s, str) > SW - 8) s--;
-    text(cx - text_w(s, str) / 2, y, s, c, str);
-}
-
-/* ---- corazon ---- */
-static const char *heart_spr[8] = {
-    ".XXX.XXX.", "XXXXXXXXX", "XXXXXXXXX", "XXXXXXXXX",
-    ".XXXXXXX.", "..XXXXX..", "...XXX...", "....X...." };
-static void heart(int x, int y, u32 c, int a) {
-    for (int r = 0; r < 8; r++) for (int q = 0; q < 9; q++)
-        if (heart_spr[r][q] == 'X') { if (a >= 255) put(x + q, y + r, c); else putA(x + q, y + r, c, a); }
-}
-
-/* ---- fondo + estrellas ---- */
-typedef struct { float x, y, v; } Star;
-static Star stars[NSTAR];
-
-static void draw_bg(int flash) {
-    for (int y = 0; y < SH; y++) {
-        float t = y / (float)SH;
-        int r = 8 + (int)(26 * t) + flash;
-        int g = 6 + (int)(10 * t);
-        int b = 24 + (int)(44 * t);
-        if (r > 255) r = 255;
-        u32 c = RGB(r, g, b);
-        u32 *p = &canvas[y * STRIDE];
-        for (int x = 0; x < SW; x++) p[x] = c;
-    }
-}
-static void draw_stars(void) {
-    for (int i = 0; i < NSTAR; i++) {
-        int br = 90 + (int)(stars[i].v * 50.0f);
-        if (br > 255) br = 255;
-        int sz = stars[i].v > 1.1f ? 2 : 1;
-        rectA((int)stars[i].x, (int)stars[i].y, sz, sz, RGB(200, 210, 255), br);
-    }
-}
-
-/* ---- particulas ---- */
-typedef struct { float x, y, vx, vy; int life, max, kind; u32 col; } Part;
-static Part pt[MAXP];
-static void spawn_part(float x, float y, float vx, float vy, int life, int kind, u32 col) {
-    for (int i = 0; i < MAXP; i++) if (pt[i].life <= 0) {
-        pt[i] = (Part){x, y, vx, vy, life, life, kind, col};
+static void part(float x, float y, float vx, float vy, int life, int kind, u32 col) {
+    for (int i = 0; i < MAXPT; i++) if (pt[i].life <= 0) {
+        pt[i] = (Pt){x, y, vx, vy, life, life, kind, col};
         return;
     }
 }
+static void sparks(float x, float y, int n, u32 col) {
+    for (int i = 0; i < n; i++) {
+        float a = (rand() % 628) / 100.0f, s = 1.0f + (rand() % 300) / 100.0f;
+        part(x, y, cosf(a) * s, sinf(a) * s - 0.5f, 10 + rand() % 10, 0, col);
+    }
+}
+static void smoke(float x, float y, int n) {
+    for (int i = 0; i < n; i++)
+        part(x + (rand() % 20 - 10), y - (rand() % 40), (rand() % 100 - 50) / 100.0f, -0.4f - (rand() % 60) / 100.0f,
+             22 + rand() % 14, 1, RGB(210, 210, 225));
+}
 static void update_parts(void) {
-    for (int i = 0; i < MAXP; i++) if (pt[i].life > 0) {
+    for (int i = 0; i < MAXPT; i++) if (pt[i].life > 0) {
         pt[i].x += pt[i].vx; pt[i].y += pt[i].vy;
-        if (pt[i].kind == 0) pt[i].vy += 0.06f;
+        if (pt[i].kind == 0) pt[i].vy += 0.12f;
         pt[i].life--;
     }
 }
 static void draw_parts(void) {
-    for (int i = 0; i < MAXP; i++) if (pt[i].life > 0) {
-        int a = 255 * pt[i].life / pt[i].max;
-        if (pt[i].kind == 0) rectA((int)pt[i].x, (int)pt[i].y, 3, 3, pt[i].col, a);
-        else heart((int)pt[i].x, (int)pt[i].y, pt[i].col, a);
-    }
-}
-static void burst(float x, float y, int n, u32 col) {
-    for (int i = 0; i < n; i++) {
-        float a = (rand() % 628) / 100.0f, sp = 0.8f + (rand() % 200) / 100.0f;
-        spawn_part(x, y, cosf(a) * sp, sinf(a) * sp - 0.8f, 30 + rand() % 25, 0, col);
-    }
-}
-
-/* ---- enemigo original: "La Sombra Pixelada" (dibujado con formas) ---- */
-static void draw_enemy(int cx, int cy, int t, int mood, float tx, float ty) {
-    int bob = (int)(sinf(t * 0.05f) * 4.0f);
-    int y0 = cy + bob;
-    u32 outline = RGB(60, 30, 110), body = RGB(118, 78, 190), light = RGB(190, 150, 255);
-
-    circleA(cx, y0 + 6, 46, RGB(120, 80, 220), 28);
-    circleA(cx, y0 + 6, 36, RGB(140, 100, 240), 28);
-
-    // cuerpo con borde ondulado
-    for (int x = -25; x <= 24; x++) {
-        int bottom = y0 + 28 + (int)(sinf(x * 0.45f + t * 0.15f) * 3.0f);
-        rect(cx + x, y0, 1, bottom - y0 + 2, outline);
-    }
-    for (int x = -23; x <= 22; x++) {
-        int bottom = y0 + 28 + (int)(sinf(x * 0.45f + t * 0.15f) * 3.0f);
-        rect(cx + x, y0, 1, bottom - y0, body);
-    }
-    circle(cx, y0, 26, outline);
-    circle(cx, y0, 24, body);
-    circleA(cx - 9, y0 - 11, 8, light, 110);
-
-    // antena con orbe pulsante
-    rect(cx + 2, y0 - 38, 2, 14, outline);
-    int pulse = 3 + (int)(sinf(t * 0.12f) * 1.5f + 1.5f);
-    circleA(cx + 3, y0 - 40, pulse + 4, RGB(255, 230, 120), 70);
-    circle(cx + 3, y0 - 40, 4, RGB(255, 240, 160));
-
-    // ojos que siguen al jugador
-    float ddx = (tx - cx) / 60.0f, ddy = (ty - y0) / 80.0f;
-    if (ddx > 1) { ddx = 1; }
-    if (ddx < -1) { ddx = -1; }
-    if (ddy > 1) { ddy = 1; }
-    if (ddy < -1) { ddy = -1; }
-    int blink = (t % 200) < 6;
-    for (int e = -1; e <= 1; e += 2) {
-        int ex = cx + e * 11, ey = y0 - 2;
-        if (blink || mood == 1) {
-            rect(ex - 6, ey + (mood == 1 ? -1 : 1), 13, 3, RGB(255, 255, 255));
-        } else {
-            circle(ex, ey, 7, RGB(255, 255, 255));
-            circle(ex + (int)(ddx * 3), ey + (int)(ddy * 3), 3, RGB(30, 20, 60));
+    for (int i = 0; i < MAXPT; i++) if (pt[i].life > 0) {
+        if (pt[i].kind == 0) rect((int)pt[i].x, (int)pt[i].y, 3, 3, pt[i].col);
+        else {
+            int r = 4 + (pt[i].max - pt[i].life) / 3;
+            circleA((int)pt[i].x, (int)pt[i].y, r, pt[i].col, 20 + 120 * pt[i].life / pt[i].max);
         }
     }
-    // boca
-    if (mood == 1) {
-        for (int x = -8; x <= 8; x++) rect(cx + x, y0 + 15 - (x * x) / 12, 2, 2, RGB(255, 255, 255));
+}
+
+/* ===================================================================== */
+/*  ESCENARIO (se dibuja UNA vez a bg[] y luego solo memcpy)             */
+/* ===================================================================== */
+static void render_bg(void) {
+    for (int y = 0; y < SH; y++) {
+        float t = y / (float)GY; if (t > 1) t = 1;
+        u32 c = RGB(10 + (int)(40 * t), 8 + (int)(18 * t), 30 + (int)(70 * t));
+        u32 *p = &canvas[y * STRIDE];
+        for (int x = 0; x < SW; x++) p[x] = c;
+    }
+    for (int i = 0; i < 40; i++) {
+        int sz = (i % 5 == 0) ? 2 : 1;
+        rect((int)stars_x[i], (int)stars_y[i], sz, sz, RGB(210, 220, 255));
+    }
+    // luna
+    circleA(380, 62, 46, RGB(200, 210, 255), 22);
+    circleA(380, 62, 34, RGB(220, 225, 255), 40);
+    circle(380, 62, 26, RGB(238, 240, 255));
+    circleA(372, 56, 6, RGB(205, 210, 235), 120);
+    circleA(390, 70, 4, RGB(205, 210, 235), 120);
+    // montanas lejanas y cercanas
+    for (int x = 0; x < SW; x++) {
+        int h1 = 150 + (int)(28 * sinf(x * 0.012f) + 16 * sinf(x * 0.031f + 1.0f));
+        rect(x, h1, 1, GY - h1, RGB(26, 26, 62));
+        int h2 = 178 + (int)(18 * sinf(x * 0.02f + 2.0f) + 9 * sinf(x * 0.05f));
+        rect(x, h2, 1, GY - h2, RGB(18, 18, 44));
+    }
+    // arboles
+    for (int i = 0; i < 12; i++) {
+        int x = 10 + i * 42 + (i * 17) % 13;
+        int h = 34 + (i * 29) % 30;
+        rect(x - 2, GY - h, 4, h, RGB(10, 10, 26));
+        circle(x, GY - h - 6, 12 + (i % 3) * 3, RGB(12, 16, 32));
+    }
+    // suelo
+    rect(0, GY, SW, SH - GY, RGB(46, 36, 50));
+    rect(0, GY, SW, 3, RGB(96, 80, 100));
+    for (int y = GY + 6; y < SH; y += 9) rect(0, y, SW, 1, RGB(36, 28, 42));
+    for (int x = 0; x < SW; x += 38) for (int y = GY + 8; y < SH; y += 18) rect(x + (y % 2) * 14, y, 10, 1, RGB(70, 58, 76));
+    // faroles
+    for (int i = 0; i < 3; i++) {
+        int x = 70 + i * 170;
+        rect(x - 1, GY - 52, 3, 52, RGB(40, 28, 24));
+        circleA(x, GY - 56, 22, RGB(255, 190, 90), 40);
+        circle(x, GY - 56, 6, RGB(255, 220, 130));
+    }
+    memcpy(bg, canvas, sizeof(canvas));
+}
+
+/* ===================================================================== */
+/*  DIBUJO DE NINJAS                                                     */
+/* ===================================================================== */
+static void draw_ninja(const F *f, int t) {
+    int x = (int)f->x, y = (int)f->y, d = f->dir;
+    ellipseA(x, GY + 3, 15, 4, RGB(0, 0, 0), 110);
+
+    if (f->logt > 0) {   // tronco de sustitucion
+        int lx = (int)f->logx;
+        rect(lx - 6, GY - 34, 12, 34, RGB(110, 76, 44));
+        rect(lx - 6, GY - 34, 12, 3, RGB(150, 106, 64));
+        rect(lx - 2, GY - 24, 4, 2, RGB(70, 46, 26));
+    }
+
+    u32 skin = RGB(236, 196, 160), dark = RGB(24, 22, 36);
+    if (f->ko) {
+        rect(x - 20, y - 9, 36, 9, f->col);
+        rect(x - 22 * d, y - 12, 12, 12, skin);
+        rect(x - 22 * d, y - 12, 12, 4, f->col2);
+        return;
+    }
+    if (f->glow) {
+        int pulse = 24 + (int)(fsin(t * 0.25f) * 4.0f);
+        circleA(x, y - 30, pulse, f->col2, 38);
+        circleA(x, y - 30, pulse - 8, f->col2, 38);
+    }
+    int lean = 0;
+    if (f->hurt > 0) lean = -d * 4;
+    if (f->ult > 0) lean = d * 2;
+    int walking = f->ground && fabsf(f->vx) > 0.6f && f->atk == 0 && f->hurt == 0;
+    int lo = walking ? (int)(fsin(f->x * 0.22f) * 6.0f) : 0;
+    int crouch = (f->charging || f->guard) ? 4 : 0;
+
+    if (f->dash > 0) {   // estela de velocidad
+        for (int i = 1; i <= 3; i++) rectA(x - d * i * 12 - 6, y - 44, 12, 40, f->col2, 70 - i * 18);
+    }
+
+    // bufanda
+    int sc = (int)(fsin(t * 0.3f + f->x * 0.05f) * 3.0f);
+    rect(x - d * 8 + lean, y - 46 - crouch + sc, -d * 14 + (d > 0 ? 0 : 0), 4, f->col2);
+    rect(x - d * 8 + lean - d * 14, y - 44 - crouch + sc, 6, 4, f->col2);
+    // piernas
+    if (!f->ground) { rect(x - 6, y - 18, 5, 12, dark); rect(x + 1, y - 14, 5, 10, dark); }
+    else {
+        rect(x - 6 + lo, y - 18 + crouch, 5, 18 - crouch, dark);
+        rect(x + 1 - lo, y - 18 + crouch, 5, 18 - crouch, dark);
+    }
+    // torso
+    rect(x - 7 + lean, y - 42 + crouch, 14, 25 - crouch, f->col);
+    rect(x - 7 + lean, y - 26, 14, 3, f->col2);
+    // cabeza
+    circle(x + lean + d, y - 51 + crouch, 8, skin);
+    rect(x + lean - 8 + d, y - 55 + crouch, 17, 5, f->col2);
+    rect(x + lean + d * 3 - 3, y - 55 + crouch, 6, 5, RGB(210, 215, 230));
+    rect(x + lean + d * 4, y - 50 + crouch, 3, 2, dark);
+    // brazos / ataques
+    if (f->atk > 0) {
+        int prog = 14 - f->atk; if (prog > 8) prog = 8;
+        int ext = 8 + prog * 3;
+        if (f->atkn == 1) {          // patada
+            rect(x, y - 16, d * (ext + 6), 5, dark);
+            rect(x + d * (ext + 6) - (d > 0 ? 3 : 0), y - 18, 4, 8, skin);
+        } else {                      // puno
+            rect(x, y - 36, d * ext, 5, f->col);
+            rect(x + d * ext - (d > 0 ? 4 : 0), y - 38, 5, 8, skin);
+        }
+    } else if (f->ult > 0) {
+        rect(x, y - 38, d * 24, 5, f->col);
+        rect(x + d * 24 - (d > 0 ? 4 : 0), y - 40, 5, 8, skin);
+        rect(x - d * 24, y - 38, d * 24 * -1 + 0, 5, f->col);
+    } else if (f->guard) {
+        rect(x + d * 3, y - 44, 5, 20, RGB(190, 200, 225));
+        rect(x + d * 3 - 1, y - 44, 7, 3, RGB(240, 245, 255));
+    } else if (f->charging) {
+        rect(x - 10, y - 32, 20, 4, f->col);
+        for (int i = 0; i < 2; i++) part(x + (rand() % 30 - 15), y - 6, 0, -1.4f, 14, 0, f->col2);
     } else {
-        rect(cx - 6, y0 + 14, 12, 2, RGB(255, 255, 255));
+        int sw = walking ? (int)(fsin(f->x * 0.22f + 2.0f) * 6.0f) : 0;
+        rect(x - d * 9 + lean, y - 36 + sw, 5, 14, f->col);
+        rect(x + d * 4 + lean, y - 36 - sw, 5, 14, f->col);
     }
 }
 
 /* ===================================================================== */
-/*  JUEGO                                                                */
+/*  LOGICA DE COMBATE                                                    */
 /* ===================================================================== */
-typedef struct { float x, y, vx, vy; int on; } Bullet;
-static Bullet bl[MAXB];
-
-static void spawn(float x, float y, float vx, float vy) {
-    for (int i = 0; i < MAXB; i++) if (!bl[i].on) { bl[i] = (Bullet){x, y, vx, vy, 1}; return; }
+static void spawn_pj(int kind, float x, float y, float vx, int owner) {
+    for (int i = 0; i < MAXPJ; i++) if (!pj[i].on) { pj[i] = (Pj){x, y, vx, kind, 1, owner, 0}; return; }
 }
 
-enum { ST_INTRO, ST_DODGE, ST_MENU, ST_WIN, ST_LOSE };
+// devuelve 1 si el golpe conecto
+static int damage(F *t, const F *src, int dmg, float kb, int stun) {
+    if (t->ko || t->dash > 0) return 0;
+    float sdir = (src->x < t->x) ? 1.0f : -1.0f;       // hacia donde sale despedido
+    int blocked = t->guard && t->ground && t->hurt == 0 && (t->dir == -(int)sdir);
+    if (blocked) {
+        dmg = (dmg + 3) / 4; kb *= 0.25f; stun = 6;
+        sparks(t->x + t->dir * 8, t->y - 34, 6, RGB(200, 220, 255));
+        sfx_play(SFX_SELECT);
+        t->vx = sdir * kb;
+        t->hp -= dmg;
+        return 1;
+    }
+    t->hp -= dmg; t->lastd = dmg; t->subw = 12; t->hurt = stun; t->atk = 0; t->chain = 0; t->ult = 0;
+    t->vx = sdir * kb; t->charging = 0;
+    if (kb > 5.0f) { t->vy = -5.0f; t->ground = 0; }
+    sparks(t->x, t->y - 34, 10 + dmg, RGB(255, 235, 170));
+    sfx_play(SFX_HIT);
+    shake = dmg > 8 ? 7 : 3; hitstop = dmg > 8 ? 6 : 3;
+    return 1;
+}
+
+static void try_melee(F *f, F *o) {
+    float reach = (f->atkn == 2) ? 40.0f : 34.0f;
+    float dx = (o->x - f->x) * f->dir;
+    if (dx > -4 && dx < reach && fabsf(o->y - f->y) < 36.0f) {
+        int dmg = (f->atkn == 2) ? 10 : (f->atkn == 1 ? 6 : 5);
+        float kb = (f->atkn == 2) ? 6.5f : 2.0f;
+        if (damage(o, f, dmg, kb, f->atkn == 2 ? 26 : 12)) {
+            f->ch += 6; if (f->ch > 100) f->ch = 100;
+        }
+    }
+}
+
+static void step_fighter(F *f, F *o, const In *in) {
+    f->glow = (f->ch >= 100.0f);
+    if (f->logt > 0) f->logt--;
+    if (f->kcd > 0) f->kcd--;
+    if (f->dcd > 0) f->dcd--;
+
+    // gravedad / movimiento libre
+    f->vy += 0.55f; f->y += f->vy;
+    if (f->y >= GY) { f->y = GY; f->vy = 0; f->ground = 1; } else f->ground = 0;
+    f->x += f->vx;
+    if (f->x < 22) { f->x = 22; f->vx = 0; }
+    if (f->x > SW - 22) { f->x = SW - 22; f->vx = 0; }
+    if (f->ground) { f->vx *= 0.82f; if (fabsf(f->vx) < 0.05f) f->vx = 0; }
+
+    if (f->ko) return;
+    if (f->ch < 100.0f) { f->ch += 0.10f; if (f->ch > 100.0f) f->ch = 100.0f; }
+    f->guard = 0; f->charging = 0;
+
+    // SUSTITUCION con tronco
+    if (f->hurt > 0) {
+        f->hurt--;
+        if (f->subw > 0) {
+            f->subw--;
+            if (in->dash && f->ch >= 25.0f) {
+                f->ch -= 25.0f; f->hp += f->lastd; if (f->hp > 100) f->hp = 100;
+                f->logx = f->x; f->logt = 24;
+                smoke(f->x, f->y, 8);
+                f->x = o->x - o->dir * 46.0f;
+                if (f->x < 24) f->x = o->x + 46.0f;
+                if (f->x > SW - 24) f->x = o->x - 46.0f;
+                f->hurt = 0; f->vx = 0; f->vy = 0; f->dir = (o->x > f->x) ? 1 : -1;
+                smoke(f->x, f->y, 8);
+                sfx_play(SFX_BLIP);
+                return;
+            }
+        }
+        return;
+    }
+    if (f->ult > 0) {
+        f->ult--;
+        if (f->ult == 24) { spawn_pj(PJ_ORB, f->x + f->dir * 22, f->y - 34, f->dir * 6.5f, f == o ? 0 : (f->col == RGB(40, 120, 220) ? 0 : 1)); flashv = 90; shake = 6; sfx_play(SFX_SPARE); }
+        return;
+    }
+    if (f->atk > 0) {
+        f->atk--;
+        if (f->atk == 8) { f->hitdone = 0; }
+        if (f->atk <= 8 && !f->hitdone && f->atk >= 5) { try_melee(f, o); f->hitdone = 1; }
+        if (f->atk == 0) f->chain = 14;
+        return;
+    }
+    if (f->chain > 0) f->chain--;
+    if (f->dash > 0) {
+        f->dash--; f->vx = f->dir * 7.5f; return;
+    }
+
+    // ultimate
+    if (in->ult && f->ch >= 100.0f && f->ground) { f->ult = 46; f->ch = 0; f->vx = 0; return; }
+    // dash / esquive
+    if (in->dash && f->ground && f->dcd == 0 && f->ch >= 5.0f) {
+        f->dash = 10; f->dcd = 28; f->ch -= 5.0f;
+        f->dir = in->r ? 1 : (in->l ? -1 : f->dir);
+        smoke(f->x, f->y, 3); sfx_play(SFX_BLIP); return;
+    }
+    // ataque + combo
+    if (in->atk) {
+        f->atkn = (f->chain > 0) ? (f->atkn + 1) % 3 : 0;
+        f->atk = 14; f->hitdone = 0; f->chain = 0;
+        f->vx = f->dir * (f->atkn == 2 ? 3.2f : 1.4f);
+        f->dir = (o->x > f->x) ? 1 : -1;
+        return;
+    }
+    // kunai
+    if (in->kun && f->ch >= 8.0f && f->kcd == 0) {
+        f->ch -= 8.0f; f->kcd = 20;
+        spawn_pj(PJ_KUNAI, f->x + f->dir * 12, f->y - 34, f->dir * 9.0f, f->col == RGB(40, 120, 220) ? 0 : 1);
+        sfx_play(SFX_BLIP);
+        return;
+    }
+    // guardia / cargar
+    if (in->guard && f->ground) { f->guard = 1; f->vx = 0; return; }
+    if (in->charge && f->ground) {
+        f->charging = 1; f->vx = 0;
+        f->ch += 0.75f; if (f->ch > 100.0f) f->ch = 100.0f;
+        return;
+    }
+    // movimiento
+    float sp = f->ground ? 2.4f : 2.0f;
+    if (in->l) { f->x -= sp; f->dir = -1; }
+    if (in->r) { f->x += sp; f->dir = 1; }
+    if (f->ground) f->dir = (o->x > f->x) ? 1 : -1;
+    if (in->jump && f->ground) { f->vy = -10.0f; f->ground = 0; }
+}
+
+static void update_pj(F *fs) {
+    for (int i = 0; i < MAXPJ; i++) if (pj[i].on) {
+        Pj *p = &pj[i];
+        p->x += p->vx; p->t++;
+        if (p->x < -20 || p->x > SW + 20) { p->on = 0; continue; }
+        if (p->kind == PJ_ORB && (p->t & 1)) part(p->x, p->y + (rand() % 10 - 5), -p->vx * 0.2f, 0, 12, 1, RGB(255, 200, 100));
+        F *t = &fs[1 - p->owner];
+        if (fabsf(p->x - t->x) < (p->kind == PJ_ORB ? 22.0f : 12.0f) && p->y > t->y - 62.0f && p->y < t->y + 4.0f) {
+            F src = fs[p->owner]; src.x = p->x - (p->vx > 0 ? 1.0f : -1.0f);
+            int ok = (p->kind == PJ_ORB) ? damage(t, &src, 28, 8.0f, 34) : damage(t, &src, 5, 2.5f, 12);
+            if (ok) {
+                if (p->kind == PJ_ORB) { sparks(p->x, p->y, 30, RGB(255, 190, 90)); shake = 9; }
+                p->on = 0;
+            }
+        }
+    }
+}
+
+/* ===================================================================== */
+/*  IA                                                                   */
+/* ===================================================================== */
+static void ai_think(F *f, F *o, In *in) {
+    memset(in, 0, sizeof *in);
+    float dx = o->x - f->x, dist = fabsf(dx);
+    int toward = dx > 0;
+    if (f->hurt > 0 && f->subw > 0 && f->ch >= 25.0f && (rand() % 100) < 45) in->dash = 1;
+    if (f->ch >= 100.0f && dist < 150 && f->ground && (rand() % 100) < 6) { in->ult = 1; return; }
+    if (--f->ai_t <= 0) {
+        f->ai_t = 8 + rand() % 18;
+        int r = rand() % 100;
+        if (dist > 150)      f->ai_a = r < 60 ? 0 : (r < 82 ? 3 : (r < 92 ? 5 : 6));
+        else if (dist > 50)  f->ai_a = r < 52 ? 0 : (r < 72 ? 1 : (r < 82 ? 6 : (r < 92 ? 4 : 7)));
+        else                 f->ai_a = r < 52 ? 1 : (r < 70 ? 4 : (r < 86 ? 2 : 7));
+        if (o->atk > 0 && dist < 60 && (rand() % 100) < 40) f->ai_a = 4;   // se cubre si lo atacan
+    }
+    switch (f->ai_a) {
+    case 0: if (toward) in->r = 1; else in->l = 1; break;
+    case 1: if (dist < 44) in->atk = 1; else { if (toward) in->r = 1; else in->l = 1; } break;
+    case 2: if (toward) in->l = 1; else in->r = 1; break;
+    case 3: in->kun = 1; break;
+    case 4: in->guard = 1; break;
+    case 5: in->charge = 1; break;
+    case 6: in->jump = 1; if (toward) in->r = 1; else in->l = 1; break;
+    case 7: in->dash = 1; if (toward) in->r = 1; else in->l = 1; break;
+    default: break;
+    }
+}
+
+/* ===================================================================== */
+/*  HUD                                                                  */
+/* ===================================================================== */
+static void bar(int x, int y, int w, int h, int val, int mx, u32 fill, u32 back, int rtl) {
+    rect(x - 2, y - 2, w + 4, h + 4, RGB(255, 255, 255));
+    rect(x - 1, y - 1, w + 2, h + 2, RGB(20, 14, 34));
+    rect(x, y, w, h, back);
+    int fw = w * (val < 0 ? 0 : val) / mx;
+    if (rtl) rect(x + w - fw, y, fw, h, fill); else rect(x, y, fw, h, fill);
+}
+
+static void draw_hud(const F *fs, int timer, int state) {
+    for (int i = 0; i < 2; i++) {
+        int rtl = i == 1;
+        int x = rtl ? SW - 12 - 190 : 12;
+        bar(x, 16, 190, 12, fs[i].hp, 100, RGB(255, 210, 40), RGB(110, 0, 24), rtl);
+        bar(x, 34, 190, 5, (int)fs[i].ch, 100, fs[i].ch >= 100.0f ? RGB(255, 140, 255) : RGB(80, 190, 255), RGB(24, 30, 70), rtl);
+        if (rtl) text(SW - 12 - text_w(1, fs[i].name), 3, 1, RGB(255, 255, 255), fs[i].name);
+        else text(12, 3, 1, RGB(255, 255, 255), fs[i].name);
+        for (int w = 0; w < 2; w++) {
+            int cx = rtl ? SW - 18 - w * 12 : 18 + w * 12;
+            circle(cx, 50, 4, RGB(255, 255, 255));
+            circle(cx, 50, 3, w < fs[i].wins ? RGB(255, 210, 40) : RGB(40, 30, 60));
+        }
+        if (fs[i].ch >= 100.0f && (state == ST_FIGHT) && ((int)(fs[i].x) & 0) == 0) {
+            int bx = rtl ? SW - 12 - 190 : 12;
+            text(bx, 42 + 8, 1, RGB(255, 160, 255), "LISTO: CUADRADO+TRIANGULO");
+        }
+    }
+    char tb[8]; snprintf(tb, sizeof tb, "%02d", timer / 60);
+    rect(SW / 2 - 22, 8, 44, 26, RGB(255, 255, 255));
+    rect(SW / 2 - 20, 10, 40, 22, RGB(20, 14, 34));
+    textc(SW / 2, 13, 2, RGB(255, 230, 120), tb);
+    // aviso de sustitucion
+    for (int i = 0; i < 2; i++)
+        if (i == 0 && fs[i].hurt > 0 && fs[i].subw > 0 && fs[i].ch >= 25.0f)
+            textc((int)fs[i].x, (int)fs[i].y - 84, 2, RGB(255, 255, 255), "O!");
+}
+
+/* ===================================================================== */
+/*  MAIN                                                                 */
+/* ===================================================================== */
+static void fighter_init(F *f, float x, int dir, u32 c1, u32 c2, const char *name) {
+    int wins = f->wins;
+    memset(f, 0, sizeof *f);
+    f->x = x; f->y = GY; f->dir = dir; f->hp = 100; f->ch = 30; f->ground = 1;
+    f->col = c1; f->col2 = c2; f->name = name; f->wins = wins; f->ai_t = 30;
+}
 
 int main(void) {
     setup_callbacks();
+    scePowerSetClockFrequency(333, 333, 166);          // maxima velocidad de CPU
     sceDisplaySetMode(0, SW, SH);
     vram[0] = (u32 *)(0x44000000);
     vram[1] = (u32 *)(0x44000000 + STRIDE * SH * 4);
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     srand((unsigned)sceKernelLibcTime(NULL));
+    for (int i = 0; i < 256; i++) sintab[i] = sinf(i * 2.0f * PI_F / 256.0f);
+    for (int i = 0; i < 40; i++) { stars_x[i] = (float)(rand() % SW); stars_y[i] = (float)(rand() % 130); }
+    render_bg();
 
     int at = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, THREAD_ATTR_USER, NULL);
     if (at >= 0) sceKernelStartThread(at, 0, NULL);
 
-    for (int i = 0; i < NSTAR; i++) {
-        stars[i].x = (float)(rand() % SW); stars[i].y = (float)(rand() % SH);
-        stars[i].v = 0.3f + (rand() % 100) / 100.0f;
-    }
-
-    const int bx = 140, by = 92, bw = 200, bh = 104;
-    float px = bx + bw / 2 - 4, py = by + bh / 2 - 4;
-    int hp = 20, state = ST_INTRO, timer = 0, turn = 0, talks = 0, sel = 0, tick = 0;
-    int invuln = 0, flash = 0;
-    float shake = 0;
-    u32 prev = 0;
-    int cur = 0;
-
-    const char *lines[] = {
-        "LA SOMBRA TE MIRA CON CURIOSIDAD.",
-        "LA SOMBRA SE RIE, PERO NO ATACA FUERTE.",
-        "LA SOMBRA PARECE CANSADA DE PELEAR."
-    };
-    const char *msg = lines[0];
+    F fs[2]; memset(fs, 0, sizeof fs);
+    const u32 BLUE = RGB(40, 120, 220), RED = RGB(200, 50, 60);
+    int state = ST_TITLE, tick = 0, timer = 0, st_t = 0, round = 1, winner = -1;
+    u32 prev = 0; int cur = 0;
 
     while (!g_quit) {
         SceCtrlData pad;
         sceCtrlPeekBufferPositive(&pad, 1);
-        u32 pressed = pad.Buttons & ~prev;
-        prev = pad.Buttons;
+        u32 pressed = pad.Buttons & ~prev; prev = pad.Buttons;
         tick++;
 
-        /* ---------------- logica ---------------- */
-        if (state == ST_INTRO) {
-            if (pressed & PSP_CTRL_CROSS) {
+        /* -------- entrada del jugador -------- */
+        In pin; memset(&pin, 0, sizeof pin);
+        float ax = (pad.Lx - 128) / 128.0f, ay = (pad.Ly - 128) / 128.0f;
+        pin.l = (pad.Buttons & PSP_CTRL_LEFT) || ax < -0.35f;
+        pin.r = (pad.Buttons & PSP_CTRL_RIGHT) || ax > 0.35f;
+        pin.jump = (pressed & (PSP_CTRL_UP | PSP_CTRL_CROSS)) || (ay < -0.6f && !(prev & 0x100000));
+        pin.atk = (pressed & PSP_CTRL_SQUARE) != 0;
+        pin.kun = (pressed & PSP_CTRL_TRIANGLE) != 0;
+        pin.dash = (pressed & PSP_CTRL_CIRCLE) != 0;
+        pin.guard = (pad.Buttons & PSP_CTRL_RTRIGGER) != 0;
+        pin.charge = (pad.Buttons & PSP_CTRL_LTRIGGER) != 0;
+        pin.ult = (pad.Buttons & PSP_CTRL_SQUARE) && (pad.Buttons & PSP_CTRL_TRIANGLE) &&
+                  (pressed & (PSP_CTRL_SQUARE | PSP_CTRL_TRIANGLE));
+        if (pin.ult) { pin.atk = 0; pin.kun = 0; }
+
+        /* -------- logica de estados -------- */
+        if (state == ST_TITLE) {
+            if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) {
                 sfx_play(SFX_CONFIRM);
-                state = ST_DODGE; timer = 0; memset(bl, 0, sizeof bl);
+                fs[0].wins = fs[1].wins = 0; round = 1;
+                fighter_init(&fs[0], 140, 1, BLUE, RGB(120, 220, 255), "KAZE");
+                fighter_init(&fs[1], 340, -1, RED, RGB(255, 150, 90), "RAIKO");
+                memset(pj, 0, sizeof pj); memset(pt, 0, sizeof pt);
+                state = ST_INTRO; st_t = 0;
             }
-        } else if (state == ST_DODGE) {
-            float sp = (pad.Buttons & PSP_CTRL_CIRCLE) ? 0.9f : 2.0f;
-            float dx = 0, dy = 0;
-            if (pad.Buttons & PSP_CTRL_LEFT)  dx -= 1;
-            if (pad.Buttons & PSP_CTRL_RIGHT) dx += 1;
-            if (pad.Buttons & PSP_CTRL_UP)    dy -= 1;
-            if (pad.Buttons & PSP_CTRL_DOWN)  dy += 1;
-            float ax = (pad.Lx - 128) / 128.0f, ay = (pad.Ly - 128) / 128.0f;
-            if (fabsf(ax) > 0.25f) dx += ax;
-            if (fabsf(ay) > 0.25f) dy += ay;
-            float len = sqrtf(dx * dx + dy * dy);
-            if (len > 1.0f) { dx /= len; dy /= len; }
-            px += dx * sp; py += dy * sp;
-            if (px < bx + 4) px = bx + 4;
-            if (px > bx + bw - 13) px = bx + bw - 13;
-            if (py < by + 4) py = by + 4;
-            if (py > by + bh - 12) py = by + bh - 12;
-
-            timer++;
-            int pat = turn % 4;
-            float spd = 1.5f + (turn > 6 ? 6 : turn) * 0.12f;
-            if (pat == 0 && timer % 12 == 0)
-                spawn(bx + 4 + rand() % (bw - 8), by + 2, 0, spd);
-            if (pat == 1 && timer % 18 == 0) {
-                int l = rand() & 1;
-                spawn(l ? bx : bx + bw, by + 6 + rand() % (bh - 12), l ? spd + 0.3f : -(spd + 0.3f), 0);
+        } else if (state == ST_INTRO) {
+            st_t++;
+            if (st_t == 70) sfx_play(SFX_CONFIRM);
+            if (st_t > 110) { state = ST_FIGHT; timer = ROUND_FRAMES; }
+        } else if (state == ST_FIGHT) {
+            if (hitstop > 0) hitstop--;
+            else {
+                In ain; ai_think(&fs[1], &fs[0], &ain);
+                step_fighter(&fs[0], &fs[1], &pin);
+                step_fighter(&fs[1], &fs[0], &ain);
+                update_pj(fs);
+                // empuje para que no se atraviesen
+                float gap = fs[1].x - fs[0].x;
+                if (fabsf(gap) < 16.0f && fabsf(fs[0].y - fs[1].y) < 30.0f && !fs[0].dash && !fs[1].dash) {
+                    float push = (16.0f - fabsf(gap)) * 0.5f * (gap >= 0 ? 1.0f : -1.0f);
+                    fs[0].x -= push; fs[1].x += push;
+                }
+                timer--;
             }
-            if (pat == 2 && timer % 6 == 0) {
-                float a = timer * 0.22f;
-                spawn(bx + bw / 2, by + bh / 2, cosf(a) * 1.2f, sinf(a) * 1.2f);
-                spawn(bx + bw / 2, by + bh / 2, cosf(a + PI_F) * 1.2f, sinf(a + PI_F) * 1.2f);
+            int over = 0;
+            for (int i = 0; i < 2; i++) if (fs[i].hp <= 0) { fs[i].hp = 0; fs[i].ko = 1; over = 1; }
+            if (timer <= 0) over = 1;
+            if (over) {
+                if (fs[0].hp > fs[1].hp) winner = 0; else if (fs[1].hp > fs[0].hp) winner = 1; else winner = -1;
+                if (winner >= 0) fs[winner].wins++;
+                if (winner == 0) sfx_play(SFX_SPARE); else sfx_play(SFX_LOSE);
+                state = ST_RDEND; st_t = 0; hitstop = 0;
             }
-            if (pat == 3) {
-                if (timer % 70 == 1)
-                    for (int k = 0; k < 12; k++) {
-                        float a = k * 2.0f * PI_F / 12.0f + timer * 0.05f;
-                        spawn(bx + bw / 2, by + 8, cosf(a) * 1.0f, sinf(a) * 1.0f);
-                    }
-                if (timer % 40 == 0) {
-                    float sx = bx + bw / 2, sy = by + 2;
-                    float a = atan2f((py + 4) - sy, (px + 4.5f) - sx);
-                    spawn(sx, sy, cosf(a) * 2.0f, sinf(a) * 2.0f);
+        } else if (state == ST_RDEND) {
+            st_t++;
+            step_fighter(&fs[0], &fs[1], &(In){0});
+            step_fighter(&fs[1], &fs[0], &(In){0});
+            update_pj(fs);
+            if (st_t > 150) {
+                if (fs[0].wins >= 2 || fs[1].wins >= 2) { state = ST_MATCH; st_t = 0; }
+                else {
+                    round++;
+                    fighter_init(&fs[0], 140, 1, BLUE, RGB(120, 220, 255), "KAZE");
+                    fighter_init(&fs[1], 340, -1, RED, RGB(255, 150, 90), "RAIKO");
+                    memset(pj, 0, sizeof pj);
+                    state = ST_INTRO; st_t = 0;
                 }
             }
-
-            for (int i = 0; i < MAXB; i++) if (bl[i].on) {
-                bl[i].x += bl[i].vx; bl[i].y += bl[i].vy;
-                if (bl[i].x < bx - 12 || bl[i].x > bx + bw + 12 ||
-                    bl[i].y < by - 12 || bl[i].y > by + bh + 12) { bl[i].on = 0; continue; }
-                float ddx = bl[i].x - (px + 4.5f), ddy = bl[i].y - (py + 4.0f);
-                if (invuln <= 0 && ddx * ddx + ddy * ddy < 5.5f * 5.5f) {
-                    bl[i].on = 0; hp -= 3; invuln = 60; shake = 6.0f; flash = 70;
-                    sfx_play(SFX_HIT);
-                    burst(px + 4, py + 4, 10, RGB(255, 60, 80));
-                }
-            }
-            if (hp <= 0) {
-                hp = 0; state = ST_LOSE; sfx_play(SFX_LOSE);
-                burst(px + 4, py + 4, 28, RGB(255, 60, 80));
-            } else if (timer > 60 * 8) {
-                state = ST_MENU; turn++; sel = 0; memset(bl, 0, sizeof bl);
-            }
-        } else if (state == ST_MENU) {
-            if (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) { sel ^= 1; sfx_play(SFX_SELECT); }
-            if (pressed & PSP_CTRL_CROSS) {
-                if (sel == 0) {
-                    talks++;
-                    msg = lines[talks > 2 ? 2 : talks];
-                    sfx_play(SFX_TALK);
-                    state = ST_DODGE; timer = 0; memset(bl, 0, sizeof bl);
-                    px = bx + bw / 2 - 4; py = by + bh / 2 - 4;
-                } else if (talks >= 2) {
-                    state = ST_WIN; sfx_play(SFX_SPARE);
-                } else {
-                    msg = "AUN NO CONFIA EN TI. HABLA PRIMERO.";
-                    sfx_play(SFX_CONFIRM);
-                    state = ST_DODGE; timer = 0; memset(bl, 0, sizeof bl);
-                    px = bx + bw / 2 - 4; py = by + bh / 2 - 4;
-                }
-            }
-        } else if (pressed & PSP_CTRL_START) {
-            hp = 20; turn = 0; talks = 0; msg = lines[0]; state = ST_INTRO;
-            invuln = 0; flash = 0; shake = 0;
-            memset(bl, 0, sizeof bl); memset(pt, 0, sizeof pt);
-            px = bx + bw / 2 - 4; py = by + bh / 2 - 4;
-            sfx_play(SFX_SELECT);
+        } else if (state == ST_MATCH) {
+            st_t++;
+            if ((pressed & PSP_CTRL_START) && st_t > 30) { state = ST_TITLE; sfx_play(SFX_SELECT); }
         }
 
-        if (state == ST_WIN && tick % 5 == 0)
-            spawn_part((float)(rand() % SW), (float)(SH - 4), 0.0f, -1.0f - (rand() % 100) / 100.0f,
-                       90, 1, (rand() & 1) ? RGB(255, 90, 130) : RGB(255, 220, 90));
-
-        if (invuln > 0) invuln--;
-        if (flash > 0) { flash -= 5; }
-        if (flash < 0) { flash = 0; }
-        shake *= 0.85f; if (shake < 0.4f) shake = 0;
-        for (int i = 0; i < NSTAR; i++) {
-            stars[i].y += stars[i].v;
-            if (stars[i].y >= SH) { stars[i].y = 0; stars[i].x = (float)(rand() % SW); }
-        }
+        if (shake > 0) shake--;
+        if (flashv > 0) flashv -= 6;
+        if (flashv < 0) flashv = 0;
         update_parts();
-        g_song = (state == ST_DODGE) ? 0 : ((state == ST_LOSE) ? 2 : 1);
+        g_song = (state == ST_FIGHT || state == ST_INTRO) ? 0 : 1;
+        if (state == ST_RDEND && winner == 1) g_song = 2;
 
-        /* ---------------- dibujo ---------------- */
+        /* -------- dibujo -------- */
         ox = oy = 0;
-        draw_bg(flash);
-        draw_stars();
+        memcpy(canvas, bg, sizeof(canvas));
+        if (shake > 0) { ox = (rand() % 5 - 2) * (shake > 4 ? 2 : 1); oy = rand() % 3 - 1; }
 
-        if (shake > 0) { ox = (rand() % 3 - 1) * (int)shake; oy = (rand() % 3 - 1) * (int)shake; }
-
-        draw_enemy(240, 50, tick, state == ST_WIN ? 1 : 0, px + 4, py + 4);
-
-        rectA(bx, by, bw, bh, RGB(0, 0, 0), 175);
-        frame(bx - 3, by - 3, bw + 6, bh + 6, 1, RGB(120, 90, 220));
-        frame(bx, by, bw, bh, 3, RGB(255, 255, 255));
-
-        for (int i = 0; i < MAXB; i++) if (bl[i].on) {
-            circleA((int)bl[i].x, (int)bl[i].y, 6, RGB(150, 200, 255), 60);
-            circle((int)bl[i].x, (int)bl[i].y, 3, RGB(255, 255, 255));
-        }
-
-        if (state == ST_DODGE || state == ST_INTRO) {
-            if (invuln <= 0 || (invuln / 4) % 2 == 0) {
-                circleA((int)px + 4, (int)py + 4, 10, RGB(255, 40, 70), 55);
-                heart((int)px, (int)py, RGB(255, 40, 60), 255);
-                put((int)px + 2, (int)py + 1, RGB(255, 170, 180));
+        if (state != ST_TITLE) {
+            // el de atras es el que esta mas arriba (salto) -> orden simple por y
+            int first = (fs[0].y <= fs[1].y) ? 1 : 0;
+            draw_ninja(&fs[first], tick);
+            draw_ninja(&fs[1 - first], tick);
+            for (int i = 0; i < MAXPJ; i++) if (pj[i].on) {
+                if (pj[i].kind == PJ_KUNAI) {
+                    int d = pj[i].vx > 0 ? 1 : -1;
+                    rect((int)pj[i].x - 6, (int)pj[i].y - 1, 12, 3, RGB(210, 215, 230));
+                    rect((int)pj[i].x + d * 5, (int)pj[i].y - 2, 3, 5, RGB(250, 250, 255));
+                    rect((int)pj[i].x - d * 8, (int)pj[i].y - 2, 3, 5, RGB(130, 60, 40));
+                } else {
+                    int r = 14 + (int)(fsin(pj[i].t * 0.5f) * 3.0f);
+                    circleA((int)pj[i].x, (int)pj[i].y, r + 10, RGB(255, 170, 60), 40);
+                    circle((int)pj[i].x, (int)pj[i].y, r, RGB(255, 210, 120));
+                    circle((int)pj[i].x, (int)pj[i].y, r - 7, RGB(255, 250, 220));
+                }
             }
-        }
-        draw_parts();
-
-        ox = oy = 0;
-
-        text(6, 6, 1, RGB(200, 190, 255), "CORAZON ESQUIVA");
-        if (state != ST_INTRO) {
-            char tb[24]; snprintf(tb, sizeof tb, "TURNO %d", turn + (state == ST_DODGE ? 1 : 0));
-            text(SW - 6 - text_w(1, tb), 6, 1, RGB(200, 190, 255), tb);
+            draw_parts();
+            ox = oy = 0;
+            if (flashv > 0) rectA(0, 0, SW, SH, RGB(255, 255, 255), flashv > 255 ? 255 : flashv);
+            draw_hud(fs, timer, state);
         }
 
-        // barra de vida
-        text(140, 204, 2, RGB(255, 255, 255), "HP");
-        rect(170, 202, 104, 16, RGB(255, 255, 255));
-        rect(172, 204, 100, 12, RGB(110, 0, 20));
-        rect(172, 204, hp * 5, 12, RGB(255, 220, 0));
-        char hb[16]; snprintf(hb, sizeof hb, "%d/20", hp);
-        text(282, 204, 2, RGB(255, 255, 255), hb);
-
-        if (state == ST_DODGE) {
-            textc(240, 234, 2, RGB(255, 255, 255), msg);
-            int w = (bw - 6) * timer / (60 * 8);
-            rect(bx + 3, by + bh + 8, bw - 6, 2, RGB(60, 50, 110));
-            rect(bx + 3, by + bh + 8, w, 2, RGB(180, 160, 255));
-        }
-        if (state == ST_MENU) {
-            textc(bx + bw / 2, by + 30, 2, RGB(255, 255, 255), "TU TURNO");
-            textc(bx + bw / 2, by + 56, 1, RGB(190, 180, 240), "ELIGE UNA ACCION");
-            int xs[2] = { 90, 270 };
-            const char *names[2] = { "HABLAR", "PERDONAR" };
-            for (int i = 0; i < 2; i++) {
-                u32 c = (i == sel) ? RGB(255, 230, 90) : RGB(220, 220, 220);
-                text(xs[i], 234, 2, c, names[i]);
-                if (i == sel) heart(xs[i] - 16 + (int)(sinf(tick * 0.2f) * 2), 237, RGB(255, 40, 60), 255);
-            }
+        if (state == ST_TITLE) {
+            rectA(0, 0, SW, SH, RGB(0, 0, 14), 120);
+            textc(240, 40, 4, RGB(255, 230, 120), "NINJA TORMENTA");
+            textc(240, 84, 2, RGB(200, 190, 255), "COMBATE EN LA ARENA");
+            // los dos luchadores del titulo
+            F a = {0}, b = {0};
+            a.x = 150; a.y = GY; a.dir = 1; a.ground = 1; a.col = BLUE; a.col2 = RGB(120, 220, 255);
+            b.x = 330; b.y = GY; b.dir = -1; b.ground = 1; b.col = RED; b.col2 = RGB(255, 150, 90);
+            draw_ninja(&a, tick); draw_ninja(&b, tick);
+            if ((tick / 30) % 2 == 0) textc(240, 120, 2, RGB(255, 255, 255), "PULSA X PARA EMPEZAR");
+            textc(240, 232, 1, RGB(210, 200, 255), "CUADRADO GOLPE  TRIANGULO KUNAI  CIRCULO ESQUIVE/SUSTITUCION");
+            textc(240, 246, 1, RGB(210, 200, 255), "L CARGAR  R GUARDIA  CUADRADO+TRIANGULO CON CHAKRA 100: TECNICA FINAL");
         }
         if (state == ST_INTRO) {
-            rectA(0, 0, SW, SH, RGB(0, 0, 10), 150);
-            textc(240, 70, 4, RGB(255, 230, 120), "CORAZON ESQUIVA");
-            textc(240, 118, 1, RGB(200, 190, 255), "UN JUEGO ORIGINAL PARA PSP");
-            if ((tick / 30) % 2 == 0) textc(240, 170, 2, RGB(255, 255, 255), "PULSA X PARA EMPEZAR");
-            textc(240, 232, 1, RGB(190, 180, 240), "CRUZ O STICK: MOVER   O: MOVER LENTO   X: ACEPTAR");
-            heart(236, 150 + (int)(sinf(tick * 0.1f) * 3), RGB(255, 40, 60), 255);
+            char rb[16]; snprintf(rb, sizeof rb, "RONDA %d", round);
+            if (st_t < 70) textc(240, 100, 4, RGB(255, 255, 255), rb);
+            else textc(240, 100, 4, RGB(255, 90, 90), "LUCHA!");
         }
-        if (state == ST_WIN) {
-            rectA(0, 96, SW, 74, RGB(0, 0, 10), 150);
-            textc(240, 110, 3, RGB(255, 230, 90), "FINAL PACIFISTA");
-            textc(240, 148, 1, RGB(255, 255, 255), "PULSA START PARA JUGAR OTRA VEZ");
+        if (state == ST_RDEND) {
+            rectA(0, 90, SW, 70, RGB(0, 0, 10), 150);
+            if (st_t > 20) {
+                textc(240, 104, 4, winner == 0 ? RGB(255, 230, 90) : RGB(255, 80, 90),
+                      winner < 0 ? "EMPATE" : (winner == 0 ? "VICTORIA" : "DERROTA"));
+            } else textc(240, 104, 4, RGB(255, 255, 255), "K.O.");
         }
-        if (state == ST_LOSE) {
-            rectA(0, 96, SW, 74, RGB(0, 0, 10), 170);
-            textc(240, 110, 3, RGB(255, 70, 90), "GAME OVER");
-            textc(240, 148, 1, RGB(255, 255, 255), "PULSA START PARA REINTENTAR");
+        if (state == ST_MATCH) {
+            rectA(0, 0, SW, SH, RGB(0, 0, 14), 170);
+            textc(240, 60, 4, fs[0].wins >= 2 ? RGB(255, 230, 90) : RGB(255, 80, 90),
+                  fs[0].wins >= 2 ? "GANASTE EL TORNEO" : "PERDISTE");
+            char sb[32]; snprintf(sb, sizeof sb, "KAZE %d - %d RAIKO", fs[0].wins, fs[1].wins);
+            textc(240, 120, 2, RGB(255, 255, 255), sb);
+            textc(240, 200, 1, RGB(210, 200, 255), "PULSA START PARA VOLVER AL TITULO");
         }
 
-        /* ---------------- presentar ---------------- */
+        /* -------- presentar -------- */
         int back = cur ^ 1; cur = back;
         memcpy(vram[back], canvas, sizeof(canvas));
         sceDisplayWaitVblankStart();
